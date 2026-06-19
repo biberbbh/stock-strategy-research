@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environment
+.venv
+
+# Claude Code
+.claude/
+
+# Large data files (re-downloadable via tushare)
+day/
+*.rar
+UnRAR.exe
+
+# WPS / Office temp files
+~$*.docx
+*.wps
+*.bak
+
+# Project backup (duplicate)
+附件5（股票买入时机）/
+
+# Temp scripts
+*_temp.py
+*_test_output.*
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Large docx (keep only tex + pdf)
+提交版/实验报告_FINAL.docx
+提交版/实验报告_最终版.docx
+提交版/实验报告_完成版.docx
+提交版/正式实验报告_*.docx
+
+# LaTeX aux files
+提交版/*.aux
+提交版/*.log
+提交版/*.out
+提交版/*.toc
