@@ -44,6 +44,24 @@ def calculate_ma(df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
 # MACD
 # ============================================================
 
+def _ema_vectorized(series: pd.Series, span: int) -> np.ndarray:
+    """
+    向量化计算指数移动平均 (EMA)。
+
+    使用 pandas.Series.ewm (C 级别优化)，替代逐行递推实现。
+    注意：不直接使用 ewm 返回值而转为 ndarray，是为了保持与旧接口兼容。
+    等价于 ewm(span=span, adjust=False).mean()。
+
+    参数:
+        series: 输入序列 (pd.Series)
+        span:   EMA 周期
+
+    返回:
+        EMA 序列 (np.ndarray)
+    """
+    return series.ewm(span=span, adjust=False).mean().to_numpy()
+
+
 def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26,
                    signal: int = 9) -> pd.DataFrame:
     """
@@ -58,12 +76,12 @@ def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26,
     返回:
         添加了 DIF, DEA, MACD 列的 DataFrame
     """
-    close = df["close"].values
-    ema_fast = _ema_recursive(close, fast)
-    ema_slow = _ema_recursive(close, slow)
+    close_series = df["close"]
+    ema_fast = _ema_vectorized(close_series, fast)
+    ema_slow = _ema_vectorized(close_series, slow)
 
     dif = ema_fast - ema_slow
-    dea = _ema_recursive(dif, signal)
+    dea = _ema_vectorized(pd.Series(dif, index=df.index), signal)
     macd_bar = 2 * (dif - dea)
 
     df["DIF"] = dif
@@ -73,48 +91,17 @@ def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26,
     return df
 
 
-def _ema_recursive(data: np.ndarray, span: int) -> np.ndarray:
-    """
-    递推计算指数移动平均 (EMA)。
-
-    等价于 pandas.Series.ewm(span=span, adjust=False).mean()。
-    注意：此为递推实现（非严格向量化），大量数据时建议直接使用
-    pd.Series.ewm(span=span, adjust=False).mean() 以获得更好性能。
-
-    参数:
-        data: 输入序列
-        span: EMA 周期
-
-    返回:
-        EMA 序列 (np.ndarray)
-    """
-    if len(data) == 0:
-        return np.array([])
-    result = np.full(len(data), np.nan)
-    # alpha = 2 / (span + 1)
-    alpha = 2.0 / (span + 1.0)
-    # 找到第一个非 NaN 值作为初始种子
-    first_valid = 0
-    while first_valid < len(data) and np.isnan(data[first_valid]):
-        first_valid += 1
-    if first_valid >= len(data):
-        return result
-    result[first_valid] = data[first_valid]
-    for i in range(first_valid + 1, len(data)):
-        if np.isnan(data[i]):
-            result[i] = result[i - 1]
-        else:
-            result[i] = alpha * data[i] + (1 - alpha) * result[i - 1]
-    return result
-
-
 # ============================================================
 # RSI
 # ============================================================
 
 def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     """
-    计算相对强弱指数 RSI。
+    计算相对强弱指数 RSI (Wilder's smoothing, 完全向量化)。
+
+    Wilder's smoothing 等价于 ewm(alpha=1/period, adjust=False):
+        S_t = alpha * x_t + (1 - alpha) * S_{t-1}
+    其中 alpha = 1/period。
 
     参数:
         df:     包含 'close' 列的 DataFrame
@@ -123,39 +110,72 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     返回:
         添加了 RSI{period} 列的 DataFrame
     """
-    close = df["close"].values
-    # 注：prepend=close[0] 使 delta[0] = 0（非标准但惯例用法），
-    # 后续 gain[1:period+1] 跳过此元素，不影响计算结果
-    delta = np.diff(close, prepend=close[0])
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
+    close = df["close"]
+    delta = close.diff()
 
-    # 使用 Wilder's smoothing (等效于 EMA，alpha = 1/period)
-    # 初始值用 period 周期的简单平均
-    avg_gain = np.full(len(delta), np.nan)
-    avg_loss = np.full(len(delta), np.nan)
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
 
-    if len(delta) > period:
-        avg_gain[period] = np.mean(gain[1:period + 1])
-        avg_loss[period] = np.mean(loss[1:period + 1])
-        for i in range(period + 1, len(delta)):
-            avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i]) / period
-            avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i]) / period
+    # Wilder's smoothing: 初始值为 period 周期的简单平均，后续用 ewm(alpha=1/period)
+    # 注意：Wilder 方法中，首期简单平均位于索引 period（第 period+1 个元素），
+    # 而非 ewm 默认的第一个元素。需要在 period 位置用 SMA 作为种子。
+    avg_gain = _wilder_smooth(gain, period)
+    avg_loss = _wilder_smooth(loss, period)
 
-    rs = np.full(len(delta), np.nan)
+    rs = np.full(len(close), np.nan)
     mask = (avg_loss > 0) & (~np.isnan(avg_gain))
     rs[mask] = avg_gain[mask] / avg_loss[mask]
     # 无亏损日时 RSI = 100
     mask2 = (avg_loss == 0) & (~np.isnan(avg_gain))
     rs[mask2] = np.inf
 
-    rsi = np.full(len(delta), np.nan)
-    rsi[rs != np.inf] = 100.0 - 100.0 / (1.0 + rs[rs != np.inf])
+    rsi = np.full(len(close), np.nan)
+    finite = rs != np.inf
+    rsi[finite] = 100.0 - 100.0 / (1.0 + rs[finite])
     rsi[rs == np.inf] = 100.0
 
     col_name = f"RSI{period}"
     df[col_name] = rsi
     return df
+
+
+def _wilder_smooth(series: pd.Series, period: int) -> np.ndarray:
+    """
+    向量化 Wilder's smoothing。
+
+    前 period 个观测值使用简单平均作为初始种子（位于索引 period），
+    后续使用 ewm(alpha=1/period, adjust=False) 递推。
+
+    关键技巧：将种子值 prepend 到待平滑序列之前，使 ewm 的第一项
+    恰好是种子值本身（adjust=False 时 y_0 = x_0），然后取 [1:] 即
+    可获得"以种子为起点"的正确递推结果。
+
+    参数:
+        series: 输入序列 (gain 或 loss)
+        period: Wilder 周期
+
+    返回:
+        np.ndarray: 平滑后的序列，前 period 个值为 NaN
+    """
+    n = len(series)
+    result = np.full(n, np.nan)
+    if n <= period:
+        return result
+    alpha = 1.0 / period
+    # 初始种子：period 周期的简单平均（跳过第一个 delta=0 的伪观测）
+    seed_vals = series.iloc[1:period + 1]
+    seed = seed_vals.mean()
+    result[period] = seed
+    # 将 seed prepend 到待平滑序列前，使 ewm 第 0 项 = seed
+    # adjust=False 时 y_0 = x_0，所以 x_0 设为 seed
+    tail = series.iloc[period + 1:]
+    combined = pd.concat([pd.Series([seed], index=[-1]), tail])
+    ewm_result = combined.ewm(alpha=alpha, adjust=False).mean()
+    # ewm_result[0] = seed (我们不需要它)
+    # ewm_result[1] = alpha * tail[0] + (1-alpha) * seed  ← 正确的递推
+    # ewm_result[2] = alpha * tail[1] + (1-alpha) * ewm_result[1]  ← 继续正确递推
+    result[period + 1:] = ewm_result.iloc[1:].to_numpy()
+    return result
 
 
 # ============================================================
@@ -164,7 +184,13 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 def calculate_kdj(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
     """
-    计算随机指标 KDJ。
+    计算随机指标 KDJ (完全向量化)。
+
+    公式:
+        RSV_t = (close_t - low_9) / (high_9 - low_9) × 100
+        K_t = 2/3 × K_{t-1} + 1/3 × RSV_t    (等价于 EMA with alpha=1/3)
+        D_t = 2/3 × D_{t-1} + 1/3 × K_t      (等价于 EMA of K with alpha=1/3)
+        J_t = 3 × K_t - 2 × D_t
 
     参数:
         df:     包含 'close', 'high', 'low' 列的 DataFrame
@@ -176,37 +202,51 @@ def calculate_kdj(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
     low_n = df["low"].rolling(window=period, min_periods=period).min()
     high_n = df["high"].rolling(window=period, min_periods=period).max()
 
-    rsv = np.full(len(df), np.nan)
     denom = high_n - low_n
+    rsv = pd.Series(np.nan, index=df.index)
     valid = denom > 0
-    rsv[valid] = (df["close"].values[valid] - low_n.values[valid]) / denom.values[valid] * 100.0
-    # 一字板：最高=最低
-    rsv[(denom == 0) & ~np.isnan(denom)] = 50.0
+    rsv.loc[valid] = ((df["close"] - low_n) / denom * 100.0).loc[valid]
+    # 一字板：最高=最低，RSV 设为 50
+    rsv.loc[(denom == 0) & denom.notna()] = 50.0
 
-    # 递推计算 K, D
-    K = np.full(len(df), np.nan)
-    D = np.full(len(df), np.nan)
-    J = np.full(len(df), np.nan)
+    # 前向填充 NaN（停牌日继承前值）以保证 ewm 递推不中断
+    rsv_ffill = rsv.ffill()
 
-    # 初始 K, D 设为 50
+    # 初始种子: 在 period-1 位置设为 50
     first_valid = period - 1
-    if first_valid < len(df):
-        K[first_valid] = 50.0
-        D[first_valid] = 50.0
-        for i in range(first_valid + 1, len(df)):
-            if not np.isnan(rsv[i]):
-                K[i] = 2.0 / 3.0 * K[i - 1] + 1.0 / 3.0 * rsv[i]
-                D[i] = 2.0 / 3.0 * D[i - 1] + 1.0 / 3.0 * K[i]
-                J[i] = 3.0 * K[i] - 2.0 * D[i]
-            else:
-                # 继承前一日值
-                K[i] = K[i - 1]
-                D[i] = D[i - 1]
-                J[i] = J[i - 1]
+    # 在 ewm 的初始位置插入种子值
+    if first_valid < len(rsv_ffill):
+        rsv_seeded = rsv_ffill.copy()
+        rsv_seeded.iloc[first_valid] = 50.0
+        # 只从 first_valid 开始做 ewm
+        rsv_after = rsv_seeded.iloc[first_valid:]
+    else:
+        rsv_after = rsv_ffill
 
-    df["K"] = K
-    df["D"] = D
-    df["J"] = J
+    # K = ewm(alpha=1/3) of RSV, seed=50
+    K_seeded = pd.Series(np.nan, index=df.index)
+    if first_valid < len(df):
+        K_ewm = rsv_after.ewm(alpha=1.0 / 3.0, adjust=False).mean()
+        K_seeded.iloc[first_valid:] = K_ewm.values
+        # 恢复原始 NaN 位置为 NaN（非停牌日不应有值）
+        K_seeded = K_seeded.where(rsv.notna(), np.nan)
+
+    # D = ewm(alpha=1/3) of K, seed=50
+    D_seeded = pd.Series(np.nan, index=df.index)
+    if first_valid < len(df) and not K_seeded.iloc[first_valid:].isna().all():
+        # 前向填充 K 以驱动 D 的 ewm
+        K_for_d = K_seeded.ffill()
+        K_after = K_for_d.iloc[first_valid:]
+        D_ewm = K_after.ewm(alpha=1.0 / 3.0, adjust=False).mean()
+        D_seeded.iloc[first_valid:] = D_ewm.values
+        D_seeded = D_seeded.where(rsv.notna(), np.nan)
+
+    # J = 3K - 2D
+    J_seeded = 3.0 * K_seeded - 2.0 * D_seeded
+
+    df["K"] = K_seeded.values
+    df["D"] = D_seeded.values
+    df["J"] = J_seeded.values
     return df
 
 

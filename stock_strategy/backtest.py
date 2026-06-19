@@ -37,23 +37,25 @@ from collections import defaultdict
 # ============================================================
 
 def calculate_transaction_cost(buy_price: float, sell_price: float,
+                               shares_per_trade: int = 100,
                                commission_rate: float = None,
                                stamp_tax_rate: float = None,
                                slippage_bps: float = None,
                                min_commission: float = None) -> float:
     """
-    计算单笔交易的往返成本（以价格百分比表示）。
+    计算单笔交易的往返成本（以买入价的百分比表示）。
 
     参数:
-        buy_price:       买入价格
-        sell_price:      卖出价格
-        commission_rate: 佣金费率 (默认取自 config)
-        stamp_tax_rate:  印花税率 (默认取自 config)
-        slippage_bps:    滑点基点 (默认取自 config)
-        min_commission:  最低佣金 (默认取自 config)
+        buy_price:        每股买入价 (元)
+        sell_price:       每股卖出价 (元)
+        shares_per_trade: 每笔交易股数 (默认 100 股 = 1 手，A 股最小交易单位)
+        commission_rate:  佣金费率 (默认取自 config)
+        stamp_tax_rate:   印花税率 (默认取自 config)
+        slippage_bps:     滑点基点 (默认取自 config)
+        min_commission:   最低佣金 (元/笔, 默认取自 config)
 
     返回:
-        成本占买入价格的百分比
+        成本占买入价格的百分比，例如 0.15 表示 0.15%
     """
     if commission_rate is None:
         from config import COMMISSION_RATE
@@ -68,28 +70,26 @@ def calculate_transaction_cost(buy_price: float, sell_price: float,
         from config import MIN_COMMISSION
         min_commission = MIN_COMMISSION
 
-    # 滑点成本 (买卖各 1bp 冲击)
-    slippage_pct = slippage_bps / 10000.0 * 2  # 买卖双向
+    buy_amount = buy_price * shares_per_trade  # 买入成交金额 (元)
+    sell_amount = sell_price * shares_per_trade  # 卖出成交金额 (元)
 
-    # 佣金成本 (买卖各万分之三)
-    commission_pct = commission_rate * 2  # 双向
+    # 滑点成本 (买卖各 1bp 冲击)
+    slippage_cost = (buy_amount + sell_amount) * (slippage_bps / 10000.0)
+
+    # 佣金 = max(成交金额 × 费率, 最低佣金)，买卖双向
+    buy_commission = max(buy_amount * commission_rate, min_commission)
+    sell_commission = max(sell_amount * commission_rate, min_commission)
 
     # 印花税 (仅卖出)
-    stamp_pct = stamp_tax_rate
+    stamp_tax = sell_amount * stamp_tax_rate
 
-    # 合计成本占买入价百分比
-    total_cost_pct = (slippage_pct + commission_pct + stamp_pct) * 100.0
+    # 总成本 (元)
+    total_cost_yuan = slippage_cost + buy_commission + sell_commission + stamp_tax
 
-    # 最低佣金调整（当佣金不足最低佣金时上浮）
-    # 简化处理：对于小额交易，佣金占比更高
-    # 按单笔买入金额估算
-    est_commission = max(buy_price * commission_rate, min_commission / 10000.0)
-    actual_commission_pct = (est_commission / buy_price) * 2 * 100.0
-    # 只在估算佣金高于费率佣金时调整
-    if actual_commission_pct > (commission_rate * 2 * 100.0):
-        total_cost_pct = (slippage_pct + actual_commission_pct / 100.0 + stamp_pct) * 100.0
+    # 转换为买入价的百分比
+    cost_pct = (total_cost_yuan / buy_amount) * 100.0
 
-    return round(total_cost_pct, 6)
+    return round(cost_pct, 6)
 
 
 # ============================================================
@@ -263,26 +263,78 @@ def calculate_metrics(trades_df: pd.DataFrame,
 # 风险调整指标
 # ============================================================
 
+def _build_daily_return_series(trades_df: pd.DataFrame,
+                               return_col: str = "net_return_pct") -> pd.Series:
+    """
+    从交易记录构建日历日收益率序列。
+
+    方法：将每笔交易的收益率归入其卖出日期（P&L realization date）。
+    日收益率 = 当日所有平仓交易收益率的算术平均（等价于等权重分配于当日
+    平仓的所有头寸）。
+
+    不同于除以总交易数 (N) 的做法（会将日收益率稀释至零），取均值保证了
+    无论总交易数多少，日收益率都在合理范围内，从而得到有意义的夏普比率和
+    最大回撤。
+
+    参数:
+        trades_df: 回测交易记录 (需含 sell_date 列)
+        return_col: 收益率列名
+
+    返回:
+        pd.Series: 以日历日为索引的日收益率序列 (小数)
+    """
+    if trades_df.empty or "sell_date" not in trades_df.columns:
+        return pd.Series(dtype=float)
+
+    # 确保 sell_date 为 datetime
+    sell_dates = pd.to_datetime(trades_df["sell_date"])
+
+    # 按卖出日聚合：日收益率 = 当日所有平仓交易收益率的均值
+    # 这等价于"每笔交易等权重，当日平均赚/亏多少"
+    daily_return_pct = pd.Series(
+        trades_df[return_col].values, index=sell_dates
+    ).groupby(level=0).mean()
+
+    # 转换为小数
+    daily_return = daily_return_pct / 100.0
+
+    # 填充日历日范围 (仅交易日，使用 'B' 商业日频率)
+    if len(daily_return) > 0:
+        date_range = pd.date_range(
+            daily_return.index.min(),
+            daily_return.index.max(),
+            freq="B"
+        )
+        daily_return = daily_return.reindex(date_range, fill_value=0.0)
+
+    return daily_return
+
+
 def calculate_risk_metrics(trades_df: pd.DataFrame,
                            return_col: str = "net_return_pct",
+                           hold_days: int = None,
                            risk_free_rate: float = None) -> dict:
     """
     计算风险调整后的绩效指标。
 
+    夏普比率：基于单笔交易收益率统计量，按持有天数年化。
+        annual_return = mean(returns) / hold_days * 252
+        annual_std    = std(returns) * sqrt(252 / hold_days)
+        sharpe        = (annual_return - rf) / annual_std
+
+    最大回撤：将交易按卖出日排序，构建累积净值曲线，计算峰值到谷底
+    的最大跌幅。
+
     参数:
-        trades_df:     回测交易记录
-        return_col:    收益率列名
+        trades_df:     回测交易记录 (需含 sell_date 列)
+        return_col:    收益率列名 (默认 "net_return_pct")
+        hold_days:     持有天数，用于年化 (若trades_df不含该列则需传入)
         risk_free_rate: 年化无风险利率 (默认取自 config)
 
     返回:
         dict: {
-            "sharpe_ratio": 夏普比率 (年化),
-            "max_drawdown": 最大回撤 (%),
-            "calmar_ratio": 卡玛比率 (年化),
-            "profit_factor": 盈亏比,
-            "avg_win": 平均盈利 (%),
-            "avg_loss": 平均亏损 (%),
-            "win_loss_ratio": 盈亏次数比,
+            "sharpe_ratio", "max_drawdown", "calmar_ratio",
+            "profit_factor", "avg_win", "avg_loss", "win_loss_ratio",
         }
     """
     if risk_free_rate is None:
@@ -300,34 +352,54 @@ def calculate_risk_metrics(trades_df: pd.DataFrame,
             "win_loss_ratio": np.nan,
         }
 
-    returns = trades_df[return_col].values
-    n = len(returns)
+    returns = trades_df[return_col].values  # 百分比收益率
+    n_returns = len(returns)
 
-    # 日化收益率（每笔交易视为独立"日"收益的观测）
-    daily_returns = returns / 100.0  # 转换为小数
+    TRADING_DAYS_PER_YEAR = 252
 
-    # --- 夏普比率 ---
-    # 假设一年约 250 个交易日, 平均每笔交易覆盖 hold_days 天
-    # 使用单笔交易作为观测单位，年化
-    mean_ret = np.mean(daily_returns)
-    std_ret = np.std(daily_returns, ddof=1)
+    # 确定持有天数（用于年化）
+    if hold_days is None:
+        if "hold_days" in trades_df.columns:
+            hold_days = int(trades_df["hold_days"].iloc[0])
+        else:
+            # 从买入日和卖出日推算
+            if "buy_idx" in trades_df.columns and "sell_idx" in trades_df.columns:
+                hold_days = int((trades_df["sell_idx"] - trades_df["buy_idx"]).mean())
+            else:
+                hold_days = 20  # 默认
 
-    if std_ret > 0:
-        sharpe_ratio = (mean_ret * 250 - risk_free_rate) / (std_ret * np.sqrt(250))
+    # --- 夏普比率 (交易级别，年化) ---
+    if n_returns > 1:
+        # 年化收益率
+        mean_return_pct = np.mean(returns)
+        annual_return = mean_return_pct / hold_days * TRADING_DAYS_PER_YEAR  # % per year
+        # 年化波动率: std 随 sqrt(时间) 缩放
+        annual_std = np.std(returns, ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR / hold_days)
+        if annual_std > 0:
+            sharpe_ratio = (annual_return / 100.0 - risk_free_rate) / (annual_std / 100.0)
+        else:
+            sharpe_ratio = np.nan
     else:
         sharpe_ratio = np.nan
 
-    # --- 最大回撤 ---
-    # 按交易顺序计算累积收益的回撤
-    cum_returns = np.cumprod(1 + daily_returns)
-    running_max = np.maximum.accumulate(cum_returns)
-    drawdowns = (cum_returns - running_max) / running_max * 100.0
-    max_drawdown = np.min(drawdowns)
+    # --- 最大回撤 (基于按日聚合的净值曲线，避免逐笔溢出) ---
+    if n_returns > 1 and "sell_date" in trades_df.columns:
+        # 使用 _build_daily_return_series 将交易聚合为日收益率，
+        # 日数 ≈ 323 天，避免 73,915 笔逐笔累积导致的浮点溢出
+        daily_ret = _build_daily_return_series(trades_df, return_col)
+        if len(daily_ret) > 1:
+            nav = (1.0 + daily_ret).cumprod()
+            running_max = nav.cummax()
+            max_drawdown = ((nav - running_max) / running_max).min() * 100.0
+        else:
+            max_drawdown = np.nan
+    else:
+        max_drawdown = np.nan
 
     # --- 卡玛比率 ---
-    if max_drawdown < 0:
-        annual_return = mean_ret * 250
-        calmar_ratio = annual_return / abs(max_drawdown / 100.0)
+    if max_drawdown is not None and not np.isnan(max_drawdown) and max_drawdown < 0:
+        annual_return_pct = np.mean(returns) / hold_days * TRADING_DAYS_PER_YEAR
+        calmar_ratio = (annual_return_pct / 100.0) / abs(max_drawdown / 100.0)
     else:
         calmar_ratio = np.nan
 
@@ -360,13 +432,23 @@ def calculate_risk_metrics(trades_df: pd.DataFrame,
 # 统计显著性检验
 # ============================================================
 
+# scipy 为可选依赖，不可用时使用正态近似
+try:
+    from scipy import stats as scipy_stats
+    _HAS_SCIPY = True
+except ImportError:
+    scipy_stats = None
+    _HAS_SCIPY = False
+
+
 def test_win_rate_significance(trades_df: pd.DataFrame,
                                return_col: str = "net_return_pct",
                                alpha: float = 0.05) -> dict:
     """
     检验胜率是否显著高于随机（50%）。
 
-    使用单样本 t 检验和二项检验。
+    使用二项检验和 Bootstrap 置信区间。
+    若 scipy 不可用则仅计算 Bootstrap CI。
 
     参数:
         trades_df: 交易记录
@@ -375,18 +457,14 @@ def test_win_rate_significance(trades_df: pd.DataFrame,
 
     返回:
         dict: {
-            "p_value_t": t 检验 p 值,
             "p_value_binomial": 二项检验 p 值,
             "ci_95_lower": 95% CI 下界,
             "ci_95_upper": 95% CI 上界,
             "significant": 是否显著,
         }
     """
-    from scipy import stats as scipy_stats
-
     if trades_df.empty:
         return {
-            "p_value_t": np.nan,
             "p_value_binomial": np.nan,
             "ci_95_lower": np.nan,
             "ci_95_upper": np.nan,
@@ -398,8 +476,16 @@ def test_win_rate_significance(trades_df: pd.DataFrame,
     n_wins = int(np.sum(returns > 0))
 
     # --- 二项检验：H0: 胜率 = 0.5 ---
-    if n > 0:
+    if n > 0 and _HAS_SCIPY:
         p_binomial = scipy_stats.binomtest(n_wins, n, p=0.5, alternative="greater").pvalue
+    elif n > 0:
+        # 无 scipy 时用正态近似
+        import math
+        p_hat = n_wins / n
+        se = math.sqrt(0.5 * 0.5 / n)
+        z = (p_hat - 0.5) / se if se > 0 else 0
+        # 单侧标准正态 CDF 近似
+        p_binomial = round(0.5 * math.erfc(z / math.sqrt(2)), 6)
     else:
         p_binomial = np.nan
 
@@ -473,17 +559,23 @@ def walk_forward_validation(stock_data: Dict[str, pd.DataFrame],
                             step_size: int = None,
                             verbose: bool = True) -> pd.DataFrame:
     """
-    滚动窗口验证 (Walk-Forward Validation)。
+    滚动窗口样本外验证 (Rolling Window Out-of-Sample Testing)。
 
     将数据按时间划分为多个窗口：
-      - 训练窗口: 前 window_size 个交易日，用于训练/选择策略参数
+      - 训练窗口: 前 window_size 个交易日
       - 测试窗口: 紧接训练窗口后的 step_size 个交易日，用于样本外验证
     滚动推进，汇总所有样本外结果。
+
+    注意：当前版本使用固定策略参数（来自 config.py），在每个窗口
+    不做参数优化。这属于"滚动窗口样本外测试"而非标准 Walk-Forward
+    优化（后者需在训练窗内网格搜索最优参数后再应用于测试窗）。
+
+    TODO: 添加 param_grid 参数支持训练窗内参数网格搜索。
 
     参数:
         stock_data:     股票数据字典
         strategies:     策略字典
-        hold_days_list:  持有天数列表
+        hold_days_list: 持有天数列表
         window_size:    训练窗口长度（交易日）
         step_size:      窗口步长（交易日）
         verbose:        是否打印进度
@@ -578,7 +670,7 @@ def walk_forward_validation(stock_data: Dict[str, pd.DataFrame],
                 trades = backtest_all_stocks(test_data, signal_col, hold_days,
                                              include_costs=True)
                 metrics = calculate_metrics(trades, return_col="net_return_pct")
-                risk = calculate_risk_metrics(trades, return_col="net_return_pct")
+                risk = calculate_risk_metrics(trades, return_col="net_return_pct", hold_days=hold_days)
 
                 all_summaries.append({
                     "窗口": w + 1,
@@ -684,7 +776,7 @@ def run_full_backtest(stock_data: Dict[str, pd.DataFrame],
                                          include_costs=include_costs)
             return_col = "net_return_pct" if include_costs else "gross_return_pct"
             metrics = calculate_metrics(trades, return_col=return_col)
-            risk = calculate_risk_metrics(trades, return_col=return_col)
+            risk = calculate_risk_metrics(trades, return_col=return_col, hold_days=hold_days)
             sig_test = test_win_rate_significance(trades, return_col=return_col)
 
             summary_rows.append({

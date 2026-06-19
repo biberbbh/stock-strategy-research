@@ -252,6 +252,8 @@ def plot_cumulative_returns(df: pd.DataFrame,
 
     # 策略累积净值：初始 1.0，在卖出日结算收益
     strat_cum = np.ones(n)
+    initialized = np.zeros(n, dtype=bool)  # 标记哪些位置已被交易覆盖
+
     for _, trade in trades.iterrows():
         buy_idx = int(trade["buy_idx"])
         sell_idx = int(trade["sell_idx"])
@@ -259,19 +261,23 @@ def plot_cumulative_returns(df: pd.DataFrame,
 
         # 持有期间复制前一日净值，卖出日应用收益
         for k in range(buy_idx, sell_idx + 1):
-            if k < n:
-                if k == sell_idx:
-                    strat_cum[k] = strat_cum[k - 1] * (1.0 + net_ret)
-                elif k == buy_idx:
-                    if k > 0:
-                        strat_cum[k] = strat_cum[k - 1]
-                    # 首个买入日前保持 1.0
-                else:
+            if k >= n:
+                continue
+            if k == sell_idx:
+                prev_val = strat_cum[k - 1] if k > 0 else 1.0
+                strat_cum[k] = prev_val * (1.0 + net_ret)
+                initialized[k] = True
+            elif k == buy_idx:
+                if k > 0:
                     strat_cum[k] = strat_cum[k - 1]
+                initialized[k] = True
+            else:
+                strat_cum[k] = strat_cum[k - 1]
+                initialized[k] = True
 
-    # 填充未覆盖的区间为前一有效值
+    # 填充未初始化的区间（未参与任何交易的日期）
     for k in range(1, n):
-        if strat_cum[k] == 1.0 and strat_cum[k - 1] != 1.0:
+        if not initialized[k]:
             strat_cum[k] = strat_cum[k - 1]
 
     # 基准：买入持有
@@ -415,11 +421,7 @@ def plot_signal_time_distribution(stock_data: Dict[str, pd.DataFrame],
 
     for i, (name, dates) in enumerate(all_dates.items()):
         ax = axes[i]
-        # 按月统计
-        months = pd.date_range(dates.min(), dates.max(), freq="MS")
-        monthly_counts = [((d >= m) & (d < m + pd.DateOffset(months=1))).sum()
-                          for m, d in zip(months, [dates] * len(months))]
-        # 实际统计
+        # 按月统计信号数量
         date_series = pd.Series(dates)
         monthly_grouped = date_series.groupby(date_series.dt.to_period("M")).count()
         ax.bar(range(len(monthly_grouped)), monthly_grouped.values,
